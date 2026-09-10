@@ -269,6 +269,940 @@ derivation is in [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md).
 
 ---
 
+## The whole chain, hardware to software
+
+This section exists because docking is the point where a stack of very
+different things has to agree, and most explanations start somewhere in the
+middle. Here we start at the metal and work up to the state machine, one layer
+at a time, and say what each layer is for and what it breaks when it is wrong.
+
+We are a software studio. We write firmware, drivers and robot software; we do
+not build, wire or assemble hardware, and nothing is shipped to us. The
+hardware described here is context, so that the software makes sense sitting on
+top of it. The part we write is the onboard-computer side, and it is marked as
+such throughout.
+
+Two labels are used below and they mean different things:
+
+- **(context)** -- a statement about real hardware, included so the chain hangs
+  together. Not measured here, and nothing in this repository depends on it.
+- **(modelled)** -- something `src/autodock` actually computes, with the number
+  taken from the code.
+
+Nothing in this repository has been run on a robot. See
+[Limitations](#limitations).
+
+### 1. The physical chain, bottom to top
+
+```
+              THE DOCK                                   THE ROBOT
+        (bolted down, never moves)              (everything that has to move)
+
+  +---------------------------+                +-----------------------------+
+  |  fiducial marker          | ~~~ light ~~~> |  lens                       |
+  |  funnel / guide ramps     |                |  image sensor               |
+  |  spring contacts  + -     |                +--------------+--------------+
+  +-------------+-------------+                               |
+                |                                             | MIPI CSI-2 or USB
+                | metal touches metal                         | frames
+                |                                             v
+                |                              +-----------------------------+
+                |                              |  onboard computer           |
+                |                              |  detector, pose solve,      |
+                |                              |  estimator, state machine,  |
+                |                              |  controller                 |
+                |                              +--------------+--------------+
+                |                                             |
+                |                                             | USB serial, UART or CAN
+                |                                             | wheel-speed setpoints
+                |                                             v
+                |                              +-----------------------------+
+                |                              |  motor controller           |
+                |                              |  current loop, velocity     |
+                |                              |  loop, watchdog             |
+                |                              +------+---------------+------+
+                |                                     | PWM           ^
+                |                                     v               | counts
+                |                              +--------------+  +--------------+
+                |                              | motors ->    |  | wheel        |
+                |                              | gearboxes -> |->| encoders     |
+                |                              | wheels       |  +--------------+
+                |                              +------+-------+
+                |                                     |
+                v                                     v
+     charge-sense line  ---+     bump switch  ---> back up to the onboard computer
+                           |
+  =========================+============================================
+                                    floor
+```
+
+Read it bottom-up if you like -- the floor is what everything is ultimately
+pushing against -- but the order below is the order a photon travels.
+
+**The dock's contacts.** Two or more spring-loaded metal pads carrying the
+charging voltage. They have to be *pressed*, not just touched, which is why a
+docking system needs a deliberate push at the end rather than a stop.
+If they are dirty or oxidised the robot arrives perfectly and never charges.
+(context)
+
+**The funnel or guide geometry.** Ramps or walls either side of the contacts
+that convert a small lateral error into a sideways force as the robot enters,
+sliding it onto centre. This is mechanical error correction, and it is free.
+It also has a limit: enter too far off, or too crooked, and the robot's docking
+shoe strikes the lip instead of sliding along it. That limit is the number
+every guard in this repository is written against. (context; the limit itself
+is modelled, as `DockGeometry`)
+
+**The fiducial marker.** A printed square with a known black-and-white pattern
+-- ArUco or AprilTag -- of known physical size, fixed to the dock face in a
+known place. "Fiducial" just means a reference object put there deliberately to
+be measured against. It is the only thing in the room whose position relative
+to the contacts is known exactly, which is what makes it worth looking at. A
+faded, scuffed or peeling marker degrades quietly: detections get rarer at long
+range first, and the robot spends longer searching before anything happens.
+(context)
+
+**The lens.** Gathers light onto the sensor and sets the field of view (FOV) --
+how wide a cone the camera sees. A wide lens keeps the marker in frame when the
+robot is off to one side but makes the marker smaller in pixels, which makes
+the pose noisier. A narrow lens does the opposite. The lens also introduces
+distortion that must be calibrated out; uncalibrated distortion shows up as a
+pose error that grows towards the edges of the image, so the robot's estimate
+gets worse exactly when the marker is drifting out of view. (context)
+
+**The image sensor.** Converts light into a grid of numbers over an exposure
+window. Two properties matter for docking. Exposure time: too long and a moving
+robot smears the marker's corners, which is pose noise. Shutter type: a rolling
+shutter reads the image out row by row, so a moving robot sees a marker that is
+skewed rather than square, and the pose solve happily returns the wrong answer
+for the skewed shape. Global-shutter sensors expose every row at once and do
+not have this problem. (context)
+
+**The link that carries frames -- MIPI CSI-2 or USB.** MIPI CSI-2 (Camera
+Serial Interface, the Mobile Industry Processor Interface standard) is a short
+ribbon cable straight into the processor's camera block: low latency, low CPU
+cost, but the camera has to be inches away. USB is longer and easier to wire
+but adds buffering and jitter, and on a busy bus it drops frames. Either way,
+what arrives is a frame that describes where the robot *was* when the shutter
+opened, not where it is now. (context)
+
+**The onboard computer.** A small Linux board. It runs the detector, the pose
+solve, the estimator, the state machine and the controller, and it is the only
+part of the chain that knows what "docking" means. Everything below it just
+moves. This is the layer our software occupies. (context for the board;
+modelled for everything it runs)
+
+**The link to the motor controller -- USB serial, UART or CAN.** UART
+(Universal Asynchronous Receiver/Transmitter) is the plain two-wire serial
+port that USB-serial adapters emulate: simple, no error checking, and a
+corrupted byte is silently a different number. CAN (Controller Area Network) is
+a differential two-wire bus designed for exactly this job: it checksums every
+frame, retransmits, prioritises messages, and tolerates electrical noise from
+motors far better. The choice shows up as how often a wheel command is lost or
+mangled, and how the system behaves when one is. (context)
+
+**The motor controller.** A microcontroller plus power electronics. It takes a
+wheel-speed setpoint and holds it, by measuring the actual wheel speed from the
+encoders and adjusting the voltage it applies through PWM (Pulse Width
+Modulation -- switching the supply on and off quickly, so the average voltage
+is whatever fraction of the time it is on). It also owns the limits: maximum
+current, maximum acceleration, and a watchdog that stops the motors if it stops
+hearing from the computer. If the watchdog is missing, a computer that hangs
+mid-approach leaves the robot driving at its last commanded speed. (context)
+
+**The motors.** Turn current into torque. Their useful property here is that
+they are fast and weak; the gearbox fixes the second part.
+
+**The gearboxes.** Trade speed for torque, and add backlash -- a small dead
+band where reversing direction moves the gears before it moves the wheel.
+Backlash is why a robot that corrects its heading by wiggling left-right near
+the dock ends up in a slightly different place than its encoders think.
+(context)
+
+**The wheels.** Where every number above becomes millimetres on the floor. The
+*effective* radius of a wheel is not its nominal radius: it depends on tyre
+compression, wear, load and surface. This is the single most important number
+in the whole chain for docking accuracy, and it is the one nobody measures.
+(context; the mismatch between the two wheels is modelled, as
+`DriveTrainSpec.asymmetry_std`)
+
+**The floor.** Provides the friction that turns wheel rotation into motion.
+Where it does not -- a threshold strip, a cable, a wet patch -- the wheel turns
+and the robot does not, and no sensor on the robot notices. (context)
+
+**The wheel encoders.** Discs on the motor or wheel shaft that emit a pulse
+train as they turn, so the controller can count revolutions and fractions of
+one. They are the robot's only sense of its own motion. They measure what the
+*wheel* did, which is not the same as what the *robot* did. (context)
+
+**The IMU, where there is one.** An IMU (Inertial Measurement Unit) is a chip
+containing accelerometers and rate gyroscopes. Its useful contribution here is
+the gyroscope's heading rate, which is independent of the wheels and therefore
+does not care about slip or tyre wear. It has its own problem: every rate gyro
+has a slowly changing zero offset, so an unbiased-looking heading integrates
+into a drifting one. This repository does not fuse a gyro, but it does model
+that offset as an error on the true heading rate (modelled;
+`DriveTrainSpec.gyro_bias_std`). (context)
+
+**The bump or contact switch.** A mechanical switch that closes when the robot
+presses against the dock. It answers exactly one question -- "am I touching
+something" -- and it is the only reliable way to resolve the last few
+millimetres of range, because the camera cannot see and odometry has drifted.
+(context; modelled as the `bump` input)
+
+**The charge-sense line.** A voltage measurement on the robot's own charging
+input. It is the only signal that says the contacts actually mated. Bump says
+the robot hit something. Charge says it hit the right thing in the right way.
+Conflating the two is the failure this repository's `VERIFY` state exists for.
+(context; modelled as the `charging` input)
+
+### 2. Why odometry alone cannot dock, and neither can vision
+
+This is the idea the whole repository is built around, so it is worth being
+slow about.
+
+**Odometry is precise and drifts without bound.** Odometry means working out
+where you are by adding up how far your wheels have turned. Every tick, the
+robot converts encoder counts into a small forward step and a small rotation,
+and adds them to a running total.
+
+The counts themselves are excellent -- an encoder resolves a fraction of a
+degree of wheel rotation. The problem is the conversion. To turn wheel rotation
+into distance you multiply by the wheel radius, and to turn the *difference*
+between the two wheels into a rotation you divide by the track width. If your
+assumed wheel radius is 1 % out, every metre you drive is 10 mm out. If the
+left wheel's effective radius is 1 % larger than the right's, a robot commanded
+to drive dead straight instead drives a gentle arc -- and its odometry, which
+uses the same nominal radius for both, insists it went straight.
+
+Four things cause this, and they are all ordinary: wheel diameter that differs
+from the number in the config file, slip on the floor, uneven tyre wear between
+the two sides, and payload sitting off-centre so one tyre compresses more than
+the other.
+
+The fatal property is that these errors *integrate*. They are not noise that
+averages out over time; they are a bias that accumulates. Drive further and the
+error is larger, always. There is no amount of odometry filtering that fixes
+it, because the information simply is not there.
+
+In this repository the modelled drive train has a 1.5 % standard deviation on
+the mismatch between the two effective wheel radii, which produces a heading
+error growing at about 3 degrees per metre driven (modelled;
+`DriveTrainSpec.asymmetry_std` and `EstimatorNoise.yaw_per_metre`). Lateral
+departure over a blind run of length `d` grows as `kappa * d^2 / 2` --
+quadratic, so the error over the last 300 mm is four times the error over the
+last 150 mm.
+
+**Vision is absolute and stops working close in.** A fiducial pose fix is
+different in kind. It does not accumulate: each frame is an independent
+measurement of where the robot is relative to the dock, and a frame taken after
+an hour of driving is exactly as good as the first one. It is noisier than
+odometry frame-to-frame, but the noise does not grow.
+
+It has a different problem: it runs out. The marker has to be big enough to
+detect at the range where the approach starts, which means it fills the frame
+and then overflows it as the robot closes. On most robots the camera sits above
+and behind the docking shoe, so the marker leaves the field of view entirely
+while the shoe is still short of the contacts. In this repository nothing at
+all is reported below 0.30 m (modelled; `MarkerModel.min_range`), detections
+get flaky in a band above that, and the detector is treated as silent past 60
+degrees of incidence (modelled; `MarkerModel.max_incidence`).
+
+```
+   accuracy
+   required
+      ^                                                          ,
+      |                                     the requirement    ,'
+      |                                     gets tighter -->  ,'
+      |                                                     ,'
+      |    vision available          vision gone          ,'
+      |  <----------------------> <---------------------,'-->
+      |                                               ,'
+      |     odometry error  ______....----''''''''''''
+      |     grows      ....''
+      +-----------------------------------------------------------> distance
+       3 m                        0.30 m                        0 m
+                              (marker lost)                  (contacts)
+```
+
+**So docking is the handover.** The two sensors are complementary in exactly
+the wrong way: the absolute one dies at the moment the relative one has
+accumulated the most error and the tolerance is tightest. Everything difficult
+about docking lives in the last stretch where you have already lost the good
+sensor and have not yet touched the metal.
+
+That reframes the problem usefully. The question is not "how do I drive to the
+dock". It is: *when the camera goes quiet, how good is my estimate, and is it
+good enough to spend the remaining distance on dead reckoning alone?* The
+answer has to be computed before going blind, because afterwards there is no
+new information to change your mind with.
+
+That is what `COMMIT` is: the robot stops at the last range where the marker is
+still observable, spends time there gathering fixes while stationary, predicts
+where the blind segment will end, and either goes or backs out. It is the only
+place in the behaviour where the robot gets to choose whether to accept the
+handover.
+
+### 3. The signal path, and the loop it closes
+
+```
+   dock marker
+        |  photons                                       continuous
+        v
+   +---------------------------+
+   | lens + image sensor       |  exposure: as long as the light demands
+   +---------------------------+
+        |  one frame in memory                    50-120 fps capable,
+        |                                         commonly configured
+        |                                         slower           (context)
+        v
+   +---------------------------+
+   | fiducial detector         |  finds the 4 corners, in pixels
+   | apriltag_ros / aruco_ros  |  NOT part of this repository
+   +---------------------------+
+        |  4 image points + the marker's ID
+        v
+   +---------------------------+
+   | pose solve (PnP)          |  known 3-D corners + camera intrinsics
+   +---------------------------+  -> where the camera must have been
+        |  marker pose in the CAMERA OPTICAL frame
+        v
+   +---------------------------+
+   | transform chain           |  optical -> camera -> body -> dock
+   +---------------------------+
+        |  MarkerObservation(s, lateral, yaw, sigmas, age)
+        |  2 control ticks old                            (modelled)
+        v
+   +---------------------------+
+   | DockEstimator             | <---- odometry twist (v, omega)   25 Hz
+   | replay, gate, floor,      |
+   | watchdog                  |
+   +---------------------------+
+        |  DockError(s, lateral, yaw) + sigmas + age
+        v
+   +---------------------------+
+   | guards -> state machine   |  35 transitions, abort first      25 Hz
+   +---------------------------+
+        |  DockState
+        v
+   +---------------------------+
+   | DockingController         |  pure pursuit / turn / line / arc
+   +---------------------------+
+        |  body twist (v, omega)
+        v
+   +---------------------------+
+   | clamp_twist               |  scale both, preserve curvature
+   | body_to_wheels            |  twist -> left/right wheel speed
+   | rate_limit_wheels         |  per-wheel slew limit
+   +---------------------------+
+        |  two wheel-speed setpoints, rad/s               25 Hz (modelled)
+        v
+   +---------------------------+
+   | motor controller          |  velocity loop  around 1 kHz      (context)
+   |                           |  current loop   8-25 kHz          (context)
+   +---------------------------+
+        |  PWM
+        v
+   +---------------------------+
+   | motors -> gearboxes ->    |
+   | wheels -> floor           |
+   +---------------------------+
+        |
+        +--> encoders --> odometry --------------------+
+        |                                              |
+        +--> the robot is somewhere new,               |
+             so the next frame looks different         |
+                        |                              |
+                        +--------> back to the top <---+
+```
+
+Walking it once, in words:
+
+**Photons to a frame.** Light reflects off the marker, the lens focuses it, and
+the sensor integrates it over the exposure window into a grid of pixel values
+sitting in the computer's memory.
+
+**Frame to corners.** The detector finds the black square, reads its coded
+interior to get an ID, and refines the four corner positions to sub-pixel
+accuracy. Its output is four `(u, v)` pixel coordinates and a number.
+
+**Corners to a pose.** This is the step that surprises beginners, so plainly:
+we know the marker is a flat square of a specific size, so we know the 3-D
+coordinates of its four corners in the marker's own frame -- for a 100 mm tag,
+`(±50, ±50, 0)` mm. We have just measured where those four points landed in the
+image. We know the camera's intrinsics: focal length and optical centre, from
+calibration. There is exactly one position and orientation of the camera that
+would project those known 3-D points onto those measured pixels, and solving
+for it is a standard problem called PnP (Perspective-n-Point). Invert the
+answer and you have the marker's pose relative to the camera.
+
+"Pose" here means six numbers: three of position and three of rotation. Docking
+on a flat floor only uses three of them -- forward, sideways, and heading --
+but the solve produces all six, and the ones it produces worst are the
+out-of-plane rotations, because they are estimated from the small perspective
+difference between the near and far edges of a nearly head-on square. That is
+why the modelled yaw noise grows faster with range than the translation noise
+does (modelled; `MarkerModel.yaw_sigma` versus `lateral_sigma`).
+
+**Pose to something the robot can steer on.** The pose comes out in the camera
+optical frame. Three fixed transforms move it into the frame the behaviour is
+written in -- optical to camera, camera to robot body, and marker to dock.
+Section 4 is entirely about this step, because it is where real bugs live.
+
+**Fold it into the estimate.** The fix is old by the time it arrives, so the
+estimator replays the odometry accumulated since its timestamp forward before
+using it. Then it checks the fix against what it already believes: a fix too
+far from the prediction, measured in standard deviations, is rejected rather
+than absorbed, which is how a mirrored fiducial pose is thrown away instead of
+steering the robot. The estimator carries a floor under its own uncertainty so
+it cannot become more confident than the model deserves, and a watchdog that
+re-initialises it if the gate rejects too many fixes in a row (modelled;
+`DockEstimator`).
+
+**Decide.** The estimate plus the bump and charge readings become a
+`GuardContext`. The state machine evaluates its transition table in order --
+abort conditions first, in every state -- and either changes state or does not.
+
+**Command.** The controller for the current state emits a body twist: `v`, how
+fast forward, and `omega`, how fast to rotate. Two numbers, and they are what a
+differential drive can be asked for. Nothing else.
+
+**Twist to wheels.** Inverse kinematics, and it is one line of arithmetic:
+`left = (v - omega * track/2) / wheel_radius` and
+`right = (v + omega * track/2) / wheel_radius`. Wanting to turn means asking
+one wheel to go faster than the other; wanting to spin in place means asking
+them to go opposite ways. The clamp comes first: if either wheel exceeds its
+speed limit, both `v` and `omega` are scaled by the same factor, so the robot
+follows the same curved path more slowly rather than a straighter path at the
+speed asked for.
+
+**Wheels to motion.** The motor controller receives two speed setpoints and
+runs its own loops to hold them, adjusting PWM against encoder feedback many
+times for every one of our ticks. Torque reaches the floor and the robot moves.
+
+**And back around.** The encoders report what the wheels did, which becomes an
+odometry twist and goes into the estimator. The robot is now somewhere new, so
+the next camera frame shows the marker from a different angle, so the next pose
+fix is different, so the next estimate is different, so the next command is
+different.
+
+**That last paragraph is the point.** None of these blocks is clever on its
+own. The controller does not compute a trajectory to the dock and execute it;
+it looks at the current error and emits a correction, twenty-five times a
+second, and the errors shrink because each correction is applied to a world
+that has already responded to the previous one. This is what "closing the loop"
+means, and it is why a system built from simple parts can be accurate: it never
+has to be right, only consistently less wrong.
+
+It is also why the blind segment is dangerous. During those last 300 mm the
+loop is open -- the robot is still commanding, but nothing is measuring the
+result against the dock. Errors stop being corrected and start accumulating.
+Everything the design does at `COMMIT` is an attempt to enter that open-loop
+stretch with as little error as possible, because it is the last decision that
+gets made with information.
+
+### 4. Coordinate frames
+
+A frame is just an origin and three axes that some numbers are measured
+against. Every pose in a robot is meaningless without knowing which frame it is
+in, and almost every mysterious docking bug is a pose used in the wrong one.
+
+Four frames matter here.
+
+**The camera optical frame.** Z forward along the direction the lens points, X
+right, Y down. This convention is inherited from computer vision, where the
+image X axis runs right and Y runs down, and it is the frame every PnP solver
+returns its answer in. REP-103 spells it as a frame-name suffix -- a frame
+whose name ends in `_optical` uses these axes -- and drivers in practice name
+the frame something like `camera_optical_frame`.
+
+**The robot body frame.** X forward, Y left, Z up, origin usually on the floor
+between the drive wheels. This is the robotics convention (REP-103 -- REP means
+ROS Enhancement Proposal, the numbered documents that fix these conventions).
+
+Note that the two are different, and not by a little: they disagree about what
+"Y" points at and about which axis is forward. The rotation between them is
+fixed and known, but it is not the identity, and getting it wrong produces a
+robot that steers confidently in the wrong direction. This is the single most
+common frame bug in vision-guided robots.
+
+**The dock frame.** Origin at the centre of the contact plane, +X along the
+direction the robot must travel to enter. Its axis is the approach axis. It is
+fixed to the dock, not to the room.
+
+**The world or odom frame.** A fixed frame the robot integrates its odometry
+in. "odom" is short for odometry; it is continuous and smooth but drifts
+without bound, which is exactly the property described in section 2.
+
+The chain, and where each link comes from:
+
+```
+   world / odom
+        |
+        |  integrated from wheel encoders -- smooth, drifts, unbounded
+        v
+   robot body  (base_link:  X fwd, Y left, Z up)
+        |
+        |  CAMERA MOUNT: a fixed translation (up, forward, sideways)
+        |  and a fixed rotation (tilt down, any yaw)
+        |  <-- measured once, by hand or by calibration. Never changes
+        |      unless somebody bumps the bracket
+        v
+   camera link
+        |
+        |  a fixed axis relabelling: body (X fwd, Y left, Z up)
+        |  -> optical (Z fwd, X right, Y down)
+        v
+   camera optical frame  (_optical suffix: Z fwd, X right, Y down)
+        |
+        |  MEASURED EVERY FRAME by the PnP solve
+        v
+   marker frame
+        |
+        |  a fixed offset, set by where the marker was stuck on the dock
+        v
+   dock frame  (+X = the direction the robot must travel to enter)
+```
+
+Compose that chain and invert it and you have the robot's body pose in the dock
+frame, which is the only thing the behaviour wants. In ROS 2 this composition
+is done for you by TF (the transform library; TF2 is the current version),
+which keeps a time-stamped tree of these relationships and can answer "where
+was A relative to B at time t".
+
+**Where the camera mount enters, and why it matters.** The mount offset and
+tilt sit between the body frame and the camera, so they affect every fix
+equally. A bracket that is 10 mm further forward than the configured value
+biases every range measurement by 10 mm. A bracket tilted 1 degree further down
+than configured biases every heading estimate. Because it is a bias and not
+noise, averaging more detections does not help -- it converges neatly on the
+wrong answer, which is worse than being visibly noisy. This is why "extrinsic
+calibration between camera and drive frame" is the first item on the list of
+what a real deployment would additionally need.
+
+The mount also sets the blind-segment length, which the sweeps in this
+repository identify as the most expensive parameter in the design. A camera
+mounted lower and further forward keeps the marker in view closer in, and
+[Where it stops working](#where-it-stops-working) puts a number on what that is
+worth.
+
+**Why the dock frame is the one that matters.** The robot does not care where
+it is in the room. Two robots, one in a corridor and one in a warehouse, at
+identical `(s, lateral, yaw)` relative to their docks, should do exactly the
+same thing. Writing the behaviour in the dock frame makes that true by
+construction: no guard mentions the world, no control law mentions the world,
+and the simulator is the only component that knows a world frame exists.
+
+It also removes an entire class of bug. If the approach were planned in world
+coordinates, then a localisation jump -- the moment a SLAM system corrects
+itself and the robot's believed position moves 50 mm sideways -- would move the
+target with it, mid-approach. In the dock frame that jump is invisible, because
+the marker is measured directly and the answer never passed through the map.
+
+The three numbers, concretely (modelled; `DockError`):
+
+- `s` -- remaining distance along the dock axis. Zero at the contact plane.
+- `lateral` -- signed perpendicular offset from the axis. Zero on the axis.
+- `yaw` -- heading relative to the axis. Zero pointing straight in.
+
+And the geometry they describe:
+
+```
+   lateral
+   (+, left of the axis)
+      ^
+      |                                                     contact plane
+      |                                                        s = 0
+      |         s = 0.75 m            s = 0.35 m                 |
+      |         STANDOFF              COMMIT GATE                |
+      |            |                       |                     |
+ +25mm|- - - - - - | - - - - - - - - - - - | - - - - - - - - - -[|]  tolerance
+      |            v                       v                     |  band
+      +------------o-----------------------o--------------------[|]--> +x
+      |          robot                                           |  (dock axis)
+ -25mm|- - - - - - - - - - - - - - - - - - - - - - - - - - - - -[|]
+      |            |<---- closed loop ---->|<-- 350 mm blind --->|
+      |            |    camera + odometry  |   odometry only     |
+      |
+      |     ALIGN turns here.        COMMIT stops here,
+      |     Heading only -- a        averages 10 fixes,
+      |     differential drive       plans the arc, and
+      |     cannot step sideways.    decides go / no-go.
+```
+
+The corridor the robot sweeps as it enters is not its width but
+`|lateral| + shoe_length * |sin(yaw)|`, which is why the tolerance band above
+is drawn against a *coupled* quantity rather than against lateral offset alone.
+That derivation is in
+[docs/FAILURE_MODES.md](docs/FAILURE_MODES.md).
+
+### 5. Rates, and the latency budget
+
+Nothing in the chain runs at one speed. Each layer runs at whatever rate it
+needs, and they are nested inside each other:
+
+```
+  +--------------------------------------------------------------------+
+  |  behaviour: state machine + controller          25 Hz  (modelled)   |
+  |  one tick = 40 ms                                                   |
+  |                                                                     |
+  |  +--------------------------------------------------------------+  |
+  |  |  perception: frame -> detect -> pose                          |  |
+  |  |  camera 50-120 fps capable, usually run slower  (context)     |  |
+  |  |  detector 10-25 fps on a Pi-class CPU,          (context)     |  |
+  |  |           50-110 fps GPU-accelerated at 720p                  |  |
+  |  |  modelled here as one observation per tick     (modelled)     |  |
+  |  +--------------------------------------------------------------+  |
+  |                                                                     |
+  |  +--------------------------------------------------------------+  |
+  |  |  motor controller velocity / position PID                     |  |
+  |  |  around 1 kHz                                    (context)    |  |
+  |  |                                                               |  |
+  |  |    +-----------------------------------------------------+    |  |
+  |  |    |  motor controller current / FOC loop                 |    |  |
+  |  |    |  8-25 kHz                            (context)       |    |  |
+  |  |    +-----------------------------------------------------+    |  |
+  |  +--------------------------------------------------------------+  |
+  |                                                                     |
+  |  encoder counts arrive as the wheels turn: roughly 400-3600 counts  |
+  |  per wheel revolution on common small-robot gearmotors  (context)   |
+  +--------------------------------------------------------------------+
+```
+
+**Why nested, and why inner loops must be faster.** Each loop assumes the loop
+inside it has already converged. When our controller asks for 0.09 m/s it is
+assuming that by the time the next tick comes round, the wheels are actually
+turning at that speed -- so the motor controller's velocity loop must settle
+well inside our 40 ms tick, and its current loop must settle well inside the
+velocity loop's period. If an inner loop is not comfortably faster, its
+dynamics leak into the outer loop, which then has to model them, and the outer
+loop's simple assumption -- "I command a twist and I get it" -- stops being
+true. Roughly an order of magnitude per level is the usual rule. (context)
+
+The rates in this repository:
+
+| loop | rate | where it comes from |
+|---|---|---|
+| behaviour tick (estimator, guards, controller) | 25 Hz, `dt` = 0.04 s | `EpisodeConfig.dt`, and `DockingNode(rate_hz=25.0)` |
+| observation arrival | one per tick, when the marker is visible | `FiducialSensor.observe` |
+| observation age when used | 2 ticks = 80 ms | `MarkerModel.latency_steps` |
+| motor-controller loops | not modelled at all | -- |
+
+**The latency budget.** Every stage between the shutter opening and the
+controller acting adds delay. In a real system it is roughly: exposure, plus
+readout and transfer over CSI or USB, plus detection and the pose solve, plus
+whatever transport carries the result between processes. (context)
+
+This repository does not model those stages individually. It models their sum:
+an observation handed to the estimator is two control ticks old (modelled;
+`MarkerModel.latency_steps = 2`). At 25 Hz that is 80 ms.
+
+Eighty milliseconds is not an abstraction. It is a distance, and the distance
+depends on how fast the robot is going:
+
+| speed | where it comes from | 80 ms of travel |
+|---|---|---|
+| 0.30 m/s | `ControllerGains.approach_speed` | 24 mm |
+| 0.09 m/s | `ControllerGains.final_speed` | 7.2 mm |
+| 0.07 m/s | `ControllerGains.blind_speed` | 5.6 mm |
+| 0 m/s | stopped at `COMMIT` | 0 mm |
+
+Read the top row against the 25 mm mechanical tolerance and the problem is
+obvious: a robot that acts on an 80 ms-old fix at approach speed is acting on
+information that is a whole tolerance band out of date. Two things in the
+design address it. The estimator replays the odometry accumulated since the
+fix's timestamp, which converts most of that staleness back into a correct
+present-tense estimate. And `COMMIT` stops the robot -- at zero speed, latency
+costs zero millimetres, which is the cleanest way to remove an error term
+there is. The stop is not caution; it is arithmetic.
+
+The general form, worth carrying away: **latency times speed is a distance, and
+that distance is how wrong your picture of the world is.** Halving the speed
+and halving the latency are the same thing to first order, which is why slowing
+down is a legitimate engineering fix and not a cop-out.
+
+### 6. Who owns what
+
+The split between the two computers is not arbitrary, and it is the same on
+nearly every mobile robot.
+
+```
+  +-------------------------------------------------------------+
+  |  ONBOARD COMPUTER            -- perception, state, strategy  |
+  |                                                              |
+  |  What is the dock's pose relative to me?                     |
+  |  How much do I trust that?                                   |
+  |  What phase of the manoeuvre am I in?                        |
+  |  Should I commit, or back out and try again?                 |
+  |  Am I actually charging?                                     |
+  |                                                              |
+  |  <---- THIS REPOSITORY IS THIS BOX ---->                     |
+  +-------------------------------+------------------------------+
+                                  |
+                     (v, omega)   |   twist down
+                     odometry     |   odometry up
+                                  v
+  +-------------------------------------------------------------+
+  |  MOTOR CONTROLLER            -- current, velocity, safety     |
+  |                                                              |
+  |  Hold this wheel speed.                                      |
+  |  Do not exceed this current.                                 |
+  |  Do not exceed this acceleration.                            |
+  |  If the computer goes quiet, stop. (watchdog)                |
+  |  Report encoder counts.                                      |
+  +-------------------------------------------------------------+
+```
+
+The dividing line is time. The motor controller owns everything that must
+happen faster than a network round trip and everything that must keep happening
+when the software above it fails. A current limit that only exists in Python is
+not a current limit. A stop-on-comms-loss that lives on the same computer that
+just hung is not a safety feature. (context)
+
+The onboard computer owns everything that requires knowing what the robot is
+trying to do. The motor controller has no concept of a dock.
+
+**What this repository models.** Concretely:
+
+- **Perception statistics** -- range-dependent noise, a minimum range,
+  an incidence limit, dropouts clustering near the range limits, two-tick
+  latency, and planar pose ambiguity (`perception.py`).
+- **Differential-drive kinematics** -- the non-holonomic constraint, wheel
+  speed and acceleration limits, the curvature-preserving clamp, and exact arc
+  integration (`kinematics.py`).
+- **Drive-train asymmetry and the odometry that cannot see it**
+  (`odometry.py`).
+- **The dock-frame estimator** -- latency replay, innovation gate, covariance
+  floor, divergence watchdog (`estimator.py`).
+- **The state machine and its guards** (`states.py`, `machine.py`).
+- **The controllers** -- pure pursuit, turn in place, line following, and the
+  blind-arc planner (`controller.py`).
+
+**What it assumes rather than models.** Equally concretely:
+
+- **No images.** The fiducial detector is a statistical model of a detector's
+  output. There are no pixels anywhere in this repository, no lighting, no
+  calibration error, no rolling shutter.
+- **No contact physics.** The dock is a pass/fail geometric criterion at the
+  contact plane. A real funnel guides a shoe that enters slightly off-centre,
+  and can also jam it; neither is simulated.
+- **No motor electrical dynamics.** Commanded wheel speeds become actual wheel
+  speeds instantly, subject only to the acceleration limit and a small
+  multiplicative noise. No current, no torque, no back-EMF, no thermal limit.
+- **No link behaviour.** No dropped serial frames, no CAN arbitration delay, no
+  jitter between the computer and the motor controller.
+- **No floor interaction** beyond that multiplicative noise. No thresholds, no
+  cables, no discrete slip events.
+
+The [Limitations](#limitations) section lists the rest. The short version: this
+repository models the decision layer carefully and everything below it
+generously.
+
+### 7. What goes wrong, layer by layer
+
+Each row is a real failure, what it looks like to somebody watching the robot
+rather than reading its logs, and which layer has to be the one that handles
+it. "Handled here" means this repository has a guard for it.
+
+| layer | what goes wrong | what it looks like from outside | which layer must handle it |
+|---|---|---|---|
+| optics | marker faded, scuffed, peeling, or lens smudged | robot circles the dock for a long time before anything happens; worse at long range first | maintenance, plus a bounded search -- `search_exhausted` (handled here) |
+| optics | camera bracket knocked out of alignment | robot docks consistently 15 mm to one side, every time, on every dock | calibration. Nothing in software can see it, because a bias looks like the truth |
+| sensor | sun through a window saturating the frame | detections vanish at one time of day, at one dock, and return an hour later | sensor auto-exposure and dock siting; behaviour must survive it -- `search_exhausted`, retries (handled here) |
+| sensor | rolling shutter plus motion | pose is subtly wrong only while moving, correct when stopped | global-shutter hardware; mitigated by stopping to measure, which is what `COMMIT` does |
+| compute | detector too slow, frames queue up | robot oscillates: it steers on where it was, overshoots, corrects, overshoots | perception layer must drop stale frames; estimator latency replay bounds the damage (modelled) |
+| compute | onboard computer hangs mid-approach | robot drives into the dock, or past it, at its last commanded speed and does not stop | **the motor controller.** A command watchdog is the only thing that helps, and it must not live on the computer that hung |
+| link | dropped or corrupted serial frame | one tick of missing or wrong wheel command; usually invisible, occasionally a lurch | link layer (CAN checksums, or a sequence number over UART) plus the controller watchdog |
+| motor controller | current limit trips on the final push | robot stops just short, bump never closes, drive keeps commanding | motor controller reports it; behaviour catches the symptom -- `travel_budget_exceeded` (handled here) |
+| motor controller | velocity loop poorly tuned | commanded and actual speed differ; odometry is right, the robot is not where it should be | motor controller tuning. Above it, this is indistinguishable from drive-train error |
+| actuation | wheel slips on a threshold strip or a cable | odometry reports distance the robot did not travel; arrives short or off-axis | nothing catches it before contact. `charge_absent` catches it after (handled here) |
+| actuation | one tyre worn more than the other | robot arrives millimetres off-axis, and every retry fails in exactly the same way | calibration. Retries provably do not fix it -- see [docs/FAILURE_MODES.md](docs/FAILURE_MODES.md) §4 |
+| dock | nudged out of position by a cleaner | robot approaches the wrong patch of wall, or approaches fine but from a bad angle | the map and the navigation layer, not the docking behaviour. The marker moves with the dock, so the last two metres still work -- the staging pose no longer does |
+| dock | contacts oxidised or dirty | bump closes, robot sits there, no charging voltage ever appears, battery flat by morning | `VERIFY` and `charge_absent`, then bounded retries, then `attempts_exhausted` (handled here) |
+| dock | dock occupied by another robot | robot approaches, bumps something that is not a dock, no charge | a dock-occupied check against the fleet manager; below that, `charge_absent` degrades gracefully |
+
+Two things are worth noticing about that table.
+
+**Most rows are handled somewhere other than where they happen.** A hung
+computer is a motor-controller problem. A worn tyre is a calibration problem.
+The docking behaviour cannot fix any of them; what it can do is fail safely,
+notice, and not report success. That is a lower bar than "handle" and it is the
+right one.
+
+**`charge_absent` is the backstop for a surprising number of rows.** Whenever
+something upstream goes wrong in a way nothing else detects, the outcome is the
+same: the robot touches the dock and no voltage appears. That is why contact
+and charge are two separate guards in this design and not one. A system that
+treats bump as success converts every row in this table into a flat battery.
+
+`docs/FAILURE_MODES.md` covers the software-layer rows in proper depth -- the
+derivations, the specific guard, and the numbers behind each threshold. This
+table is the wider view: the same system seen from the hardware end, including
+the rows no amount of software fixes.
+
+### 8. What this looks like in a real ROS 2 stack
+
+Everything above is deliberately framework-free: `autodock.runtime` takes an
+observation, a bump reading and a charge reading, and returns a twist. On a
+real robot something has to fetch those and deliver that, and on most robots
+that something is ROS 2. This subsection names the real pieces so the mapping
+is concrete.
+
+**One caveat first, and it is not a small one.** ROS 2 is not installed in the
+environment this repository was developed and measured in. The node in
+`src/autodock/ros_node.py` has been written and its message-conversion
+arithmetic is unit tested, but it has never been run, against a robot or
+against a simulator. Everything in this subsection is verified against the
+upstream specifications and source, not against a running system.
+
+```
+  +----------------+  image_raw    +-------------+  image_rect   +---------------+
+  | camera driver  |-------------->|  image_proc |-------------->|  apriltag_ros |
+  |                |  camera_info  | (rectifies) |  camera_info  |  or aruco_ros |
+  +----------------+------+------->+-------------+-------------->+-------+-------+
+                          |                                              |
+                          +----------------------------------------------+
+                                                                         | /tf
+                                                                         v
+                                                                  +-------------+
+                                                                  |   TF tree   |
+                                                                  | map -> odom |
+                                                                  | -> base_link|
+                                                                  +------+------+
+                                                                         |
+   +------------------------+   odom  (nav_msgs/Odometry)   +------------v-------+
+   | base driver, or        |------------------------------>| docking behaviour  |
+   | diff_drive_controller  |                               | (autodock.runtime) |
+   |                        |<------------------------------|                    |
+   +------------------------+   cmd_vel                     +--------------------+
+```
+
+**Frames, per REP-105.** The standard tree is `map` -> `odom` -> `base_link`,
+and the rule that makes it work is that each frame has exactly one parent. So
+localisation never publishes `map` -> `base_link` directly; it reads
+`odom` -> `base_link` from the odometry source and publishes the correction
+`map` -> `odom` instead. The two frames have deliberately opposite properties,
+and REP-105 states them explicitly: a robot's pose in `odom` is continuous and
+smooth but drifts without bound, while its pose in `map` does not drift but can
+jump discretely at any time.
+
+That is section 2's trade-off written into a naming convention, and it is why
+the docking behaviour uses neither. A discrete jump in `map` mid-approach would
+move the goal; unbounded drift in `odom` is exactly what the last 350 mm cannot
+afford. The dock frame is measured directly and is immune to both.
+
+**Camera topics.** `sensor_msgs/msg/CameraInfo` carries the intrinsics and
+lives on `camera_info` in the same namespace as the image topics, so
+`/my_camera/image_raw` pairs with `/my_camera/camera_info`. `image_proc`
+consumes that pair and produces `image_rect`, the undistorted image. Fiducial
+detectors want the rectified topic, not the raw one -- feeding a detector
+distorted images gives poses that are wrong towards the edges of the frame,
+which is section 4's calibration bias arriving by a different route.
+
+**The detector.** Two packages are the usual choices, and they differ in a way
+that matters for wiring:
+
+- **`apriltag_ros`** (christianrauch), subscribes `image_rect` and
+  `camera_info`, publishes `detections` as
+  `apriltag_msgs/msg/AprilTagDetectionArray` and broadcasts the tag pose on
+  `/tf` with `child_frame_id` like `tag36h11:0`. Worth knowing: the detection
+  message carries only 2-D information -- family, id, corners, homography --
+  and *no pose field*. The 3-D pose is available only through TF. (There is
+  also an older ROS 1 lineage under `AprilRobotics/apriltag_ros` whose message
+  does carry a pose; they are not the same package.)
+- **`aruco_ros`** (PAL Robotics). Its `single` node tracks one known marker id
+  and publishes `pose` as `geometry_msgs/msg/PoseStamped` plus a TF broadcast;
+  its `marker_publisher` node publishes all markers as
+  `aruco_msgs/msg/MarkerArray`, where each `Marker` carries a
+  `geometry_msgs/PoseWithCovariance`.
+
+The node in this repository subscribes to `dock/marker_pose` as a
+`geometry_msgs/PoseStamped`, which is the shape `aruco_ros`'s `single` node
+already emits. Wired to `apriltag_ros` instead, the pose would have to come out
+of the TF tree rather than off a topic.
+
+**Velocity commands, and a real trap.** The topic is `cmd_vel`. The message
+type is `geometry_msgs/msg/Twist` or `geometry_msgs/msg/TwistStamped`, and
+which one depends on the distribution, because upstream changed it:
+
+- Nav2 on Jazzy defaults its `enable_stamped_cmd_vel` parameter to false, so it
+  publishes `Twist`. On Kilted and later the same parameter defaults to true,
+  so it publishes `TwistStamped`. The stated reason for the change is that a
+  stamped message carries a timestamp and a frame, so a stale command can be
+  rejected rather than obeyed.
+- `diff_drive_controller` in `ros2_control` moved earlier. On Humble its
+  `~/cmd_vel` is `TwistStamped` with a `use_stamped_vel` parameter to opt out;
+  on Jazzy and later that parameter is gone and it is `TwistStamped` only.
+
+The trap: on Jazzy, stock Nav2 publishes `Twist` on `cmd_vel` while stock
+`diff_drive_controller` subscribes `TwistStamped` on the same name. Different
+types on a matching topic name are simply unrelated endpoints as far as the
+middleware is concerned. Nothing errors, no warning appears, and the robot does
+not move. `ros_node.py` here publishes plain `Twist`, so on a stamped stack it
+needs `enable_stamped_cmd_vel` set or a converter in between. This is worth
+checking before concluding that a docking behaviour is broken.
+
+**Odometry.** `nav_msgs/msg/Odometry` on `odom`, with `header.frame_id` set to
+`odom` and `child_frame_id` set to `base_link`. The pose is in the header
+frame, the twist is in the child frame. The docking runtime uses only the twist
+-- `twist.twist.linear.x` and `twist.twist.angular.z` -- because it needs the
+increments to propagate its dock-frame estimate, not an absolute pose in a
+frame it has decided not to trust. (The frame names are fixed by REP-105; the
+topic name `odom` is convention rather than standard.)
+
+**Where a docking behaviour sits in Nav2.** Nav2 has had a docking server since
+its Jazzy release: the node is `docking_server`, and it exposes two actions,
+`dock_robot` and `undock_robot`, of types `nav2_msgs/action/DockRobot` and
+`nav2_msgs/action/UndockRobot`. A `DockRobot` goal names either a dock from a
+database or an explicit dock pose, and by default asks the server to navigate
+to the staging pose first. Its feedback reports one of `NAV_TO_STAGING_POSE`,
+`INITIAL_PERCEPTION`, `CONTROLLING`, `WAIT_FOR_CHARGE` or `RETRY`.
+
+The **staging pose** is the concept that makes the handover clean: the pose
+near the dock that the navigation stack drives to, chosen to be close enough
+that the dock can be detected reliably, and far enough that imperfect
+localisation still leaves room to manoeuvre. Above it, Nav2 is doing ordinary
+path planning through a costmap. Below it, none of that applies -- the robot is
+working off a direct measurement of the dock -- and it is that lower half this
+repository is about.
+
+Docks are plugins implementing `opennav_docking_core::ChargingDock`, and the
+interface is a fair summary of what any docking system has to answer:
+`getStagingPose`, `getRefinedPose`, `isDocked`, `isCharging`,
+`disableCharging` and `hasStoppedCharging`. Two of those are worth pausing on.
+`isDocked` and `isCharging` are separate calls, which is the same distinction
+this repository draws between `ENGAGE` and `VERIFY` and for the same reason.
+And `hasStoppedCharging` exists so that undocking waits for current to actually
+stop before the robot backs off the contacts, which is a wear problem we do not
+model at all.
+
+The mapping, for orientation:
+
+| here | roughly, in a Nav2 stack |
+|---|---|
+| `MarkerObservation` | `apriltag_ros` / `aruco_ros` output resolved through TF |
+| `DockEstimator` | the filtering inside a `ChargingDock` plugin's `getRefinedPose` |
+| the standoff pose at 0.75 m | the staging pose from `getStagingPose` |
+| `SEARCH`, `ACQUIRE` | the `INITIAL_PERCEPTION` feedback phase |
+| `APPROACH` ... `BLIND_APPROACH` | the `CONTROLLING` feedback phase |
+| `ENGAGE`, and the bump input | `isDocked` |
+| `VERIFY`, and the charge input | `isCharging`, then `WAIT_FOR_CHARGE` |
+| `RETREAT` and the attempt counter | the server's `RETRY` phase and `num_retries` |
+| `ABORTED` with a named guard | a `DockRobot` result `error_code` |
+
+The correspondence is close enough to be useful and not close enough to be a
+drop-in: the pieces this repository spends its effort on -- the explicit go/no-go
+gate before going blind, the planned blind arc, and the coupled swept-width
+criterion -- are decisions a `ChargingDock` plugin would have to make somewhere
+inside `getRefinedPose` and its control loop, rather than things the Nav2
+interface asks for by name.
+
+None of this has been run. It is written down so that the gap between this
+repository and a deployment is a list of specific, checkable things rather than
+a vague one.
+
+---
+
 ## Worked example
 
 Real output, pasted unedited:
