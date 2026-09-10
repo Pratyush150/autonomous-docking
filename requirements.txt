@@ -1,0 +1,4 @@
+numpy>=1.21
+# Optional. Used only by examples/make_figures.py; the library, the examples
+# that print numbers, and the whole test suite run without it.
+matplotlib>=3.4
